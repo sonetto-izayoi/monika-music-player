@@ -1,0 +1,12 @@
+{
+  "header_version": 1,
+  "author": "Community Project",
+  "name": "Monika Music Player",
+  "version": "0.5.2",
+  "modules": [
+    "main"
+  ],
+  "description": "Rounded Spotify-inspired player with robust MAS autostart, Windows media-session sync for Spotify/YouTube Music, and current-track metadata shared with Monika.",
+  "settings_pane": "monika_music_player_settings_screen",
+  "priority": 0
+}

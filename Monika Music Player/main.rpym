@@ -1,0 +1,448 @@
+# Monika Music Player - MAS Submod Framework module.
+# This file is loaded by the submod framework through header.json.
+
+init -990 python:
+    import os
+    import sys
+    import time
+    import subprocess
+    import glob
+    import traceback
+    import codecs
+    try:
+        _mmp_unicode = unicode
+    except NameError:
+        _mmp_unicode = str
+
+    def monika_music_player_log(message):
+        try:
+            log_path = os.path.join(renpy.config.gamedir, "monika_music_player_debug.log")
+            handle = codecs.open(log_path, "a", "utf-8")
+            try:
+                try:
+                    message_text = _mmp_unicode(message)
+                except Exception:
+                    message_text = repr(message)
+                line = u"[MMP %s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message_text)
+                handle.write(line)
+            finally:
+                handle.close()
+        except Exception:
+            pass
+
+    monika_music_player_log("Classic Submod Framework bootstrap executing; gamedir=%s" % renpy.config.gamedir)
+
+    # One-time migration ensures this update starts enabled even if an earlier
+    # broken build left a stale disabled preference. The user can turn it off again.
+    if getattr(persistent, "monika_music_player_migration", 0) < 502:
+        persistent.monika_music_player_autostart = True
+        persistent.monika_music_player_migration = 502
+        try:
+            renpy.save_persistent()
+        except Exception:
+            pass
+    elif not hasattr(persistent, "monika_music_player_autostart"):
+        persistent.monika_music_player_autostart = True
+
+    monika_music_player_process = None
+    monika_music_player_autostart_checked = False
+
+    def monika_music_player_root():
+        """Find the Music Player folder even if the user renamed its parent folder."""
+        base = os.path.join(renpy.config.gamedir, "Submods")
+        preferred = os.path.join(base, "Monika Music Player")
+        try:
+            if os.path.isfile(os.path.join(preferred, "player", "music_player.py")):
+                return preferred
+            for name in os.listdir(base):
+                candidate = os.path.join(base, name)
+                if os.path.isfile(os.path.join(candidate, "player", "music_player.py")):
+                    return candidate
+        except Exception as e:
+            monika_music_player_log("Could not scan Submods directory: %s" % e)
+        return preferred
+
+    def monika_music_player_probe_pyside(pythonw_path):
+        """Check whether this interpreter can import PySide6 before choosing it.
+        A Popen success alone is not enough: WindowsApps aliases can exist while
+        redirecting to an unavailable Store package or a Python without Qt.
+        """
+        base = os.path.basename(pythonw_path).lower()
+        probe_exe = None
+        args = []
+        if base == "pyw.exe":
+            probe_exe = os.path.join(os.path.dirname(pythonw_path), "py.exe")
+            if os.path.isfile(probe_exe):
+                args = [probe_exe, "-3", "-c", "import PySide6; print('MMP_PYSIDE_OK')"]
+        elif base == "pythonw.exe":
+            probe_exe = os.path.join(os.path.dirname(pythonw_path), "python.exe")
+            if os.path.isfile(probe_exe):
+                args = [probe_exe, "-c", "import PySide6; print('MMP_PYSIDE_OK')"]
+        elif base == "python.exe":
+            probe_exe = pythonw_path
+            args = [probe_exe, "-c", "import PySide6; print('MMP_PYSIDE_OK')"]
+        elif base == "py.exe":
+            probe_exe = pythonw_path
+            args = [probe_exe, "-3", "-c", "import PySide6; print('MMP_PYSIDE_OK')"]
+        if not args:
+            monika_music_player_log("Cannot probe interpreter (no paired console executable): %s" % pythonw_path)
+            return None
+        try:
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
+            started = time.time()
+            while proc.poll() is None and time.time() - started < 8.0:
+                time.sleep(0.2)
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                monika_music_player_log("Interpreter probe timed out: %s" % pythonw_path)
+                return False
+            out, err = proc.communicate()
+            if proc.returncode == 0 and "MMP_PYSIDE_OK" in (out or ""):
+                monika_music_player_log("PySide6 probe succeeded: %s" % pythonw_path)
+                return True
+            monika_music_player_log("PySide6 probe failed for %s (exit=%s): %s" % (pythonw_path, proc.returncode, (err or out or "no output")[-500:]))
+            return False
+        except Exception as e:
+            monika_music_player_log("Could not probe interpreter %s: %s" % (pythonw_path, e))
+            return False
+
+    def monika_music_player_normalize_python_candidate(candidate):
+        """Prefer the windowless executable paired with a console Python/launcher."""
+        try:
+            candidate = os.path.abspath(candidate)
+            base = os.path.basename(candidate).lower()
+            folder = os.path.dirname(candidate)
+            if base == "python.exe":
+                paired = os.path.join(folder, "pythonw.exe")
+                return paired if os.path.isfile(paired) else candidate
+            if base == "py.exe":
+                paired = os.path.join(folder, "pyw.exe")
+                return paired if os.path.isfile(paired) else candidate
+            if base in ("pythonw.exe", "pyw.exe"):
+                return candidate
+        except Exception:
+            pass
+        return None
+
+    def monika_music_player_find_pythonw():
+        """Find a Python 3 interpreter with PySide6; do not pick a bare Store alias first."""
+        root = monika_music_player_root()
+        path_file = os.path.join(root, "python_path.txt")
+        candidates = []
+
+        # An explicit path has priority, but it is still tested for the UI dependency.
+        try:
+            handle = open(path_file, "r")
+            try:
+                for line in handle:
+                    candidate = line.strip().strip('"')
+                    if candidate and not candidate.startswith("#") and os.path.isfile(candidate):
+                        normalized = monika_music_player_normalize_python_candidate(candidate)
+                        if normalized:
+                            candidates.append(normalized)
+            finally:
+                handle.close()
+        except Exception as e:
+            monika_music_player_log("Could not read python_path.txt: %s" % e)
+
+        try:
+            candidate = getattr(persistent, "monika_music_player_pythonw", "")
+            if candidate and os.path.isfile(candidate):
+                normalized = monika_music_player_normalize_python_candidate(candidate)
+                if normalized:
+                    candidates.append(normalized)
+        except Exception:
+            pass
+
+        local = os.environ.get("LOCALAPPDATA", "")
+        pf = os.environ.get("ProgramFiles", "C:\\Program Files")
+        pfx86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+
+        # Real per-user / system Python installs first.
+        if local:
+            candidates.extend(glob.glob(os.path.join(local, "Programs", "Python", "Python*", "pythonw.exe")))
+        for base_path in (pf, pfx86):
+            candidates.extend(glob.glob(os.path.join(base_path, "Python*", "pythonw.exe")))
+
+        # Registry-discovered python.org installs.
+        try:
+            try:
+                import _winreg as winreg
+            except ImportError:
+                import winreg
+            roots = [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]
+            versions = ("3.13", "3.12", "3.11", "3.10", "3.9", "3.8")
+            for hive in roots:
+                for version in versions:
+                    for suffix in ("Software\\Python\\PythonCore\\%s\\InstallPath" % version,
+                                   "Software\\WOW6432Node\\Python\\PythonCore\\%s\\InstallPath" % version):
+                        try:
+                            key = winreg.OpenKey(hive, suffix)
+                            try:
+                                install_dir = winreg.QueryValue(key, None)
+                            finally:
+                                winreg.CloseKey(key)
+                            candidates.append(os.path.join(install_dir, "pythonw.exe"))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # Package-specific Microsoft Store runtime paths before the generic execution aliases.
+        if local:
+            candidates.extend(glob.glob(os.path.join(local, "Microsoft", "WindowsApps", "PythonSoftwareFoundation.Python.*", "pythonw.exe")))
+            candidates.extend(glob.glob(os.path.join(local, "Packages", "PythonSoftwareFoundation.Python.*", "LocalCache", "local-packages", "Python*", "pythonw.exe")))
+
+        # Launchers and PATH candidates are fallback-only because their target Python may differ.
+        path_entries = os.environ.get("PATH", "").split(os.pathsep)
+        for folder in path_entries:
+            if folder:
+                candidates.append(os.path.join(folder, "pythonw.exe"))
+                candidates.append(os.path.join(folder, "pyw.exe"))
+        if local:
+            candidates.append(os.path.join(local, "Microsoft", "WindowsApps", "pythonw.exe"))
+
+        seen = set()
+        unprobed_fallback = None
+        for candidate in candidates:
+            try:
+                if not os.path.isfile(candidate):
+                    continue
+                candidate = os.path.abspath(candidate)
+                normalized = os.path.normcase(candidate)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                base = os.path.basename(candidate).lower()
+                if base not in ("pythonw.exe", "pyw.exe", "python.exe", "py.exe"):
+                    continue
+                launch_candidate = monika_music_player_normalize_python_candidate(candidate)
+                if not launch_candidate or not os.path.isfile(launch_candidate):
+                    continue
+                probe = monika_music_player_probe_pyside(launch_candidate)
+                if probe is True:
+                    monika_music_player_log("Selected Python with PySide6: %s" % launch_candidate)
+                    return launch_candidate
+                if probe is None and unprobed_fallback is None:
+                    unprobed_fallback = launch_candidate
+            except Exception as e:
+                monika_music_player_log("Interpreter candidate skipped (%s): %s" % (candidate, e))
+
+        if unprobed_fallback:
+            monika_music_player_log("Using unprobed Windows launcher fallback: %s" % unprobed_fallback)
+            return unprobed_fallback
+        monika_music_player_log("ERROR: no Python 3 interpreter with PySide6 found. Set the full pythonw.exe path in python_path.txt and run scripts/install_dependencies.bat.")
+        return None
+
+    def monika_music_player_launch(silent=False, startup_delay=0):
+        global monika_music_player_process
+        root = monika_music_player_root()
+        script = os.path.join(root, "player", "music_player.py")
+        monika_music_player_log("Launch requested; script=%s" % script)
+
+        if not os.path.isfile(script):
+            monika_music_player_log("ERROR: music_player.py is missing")
+            if not silent:
+                renpy.notify("Music Player files are missing. Reinstall the whole submod folder.")
+            return False
+
+        try:
+            if monika_music_player_process is not None and monika_music_player_process.poll() is None:
+                if not silent:
+                    renpy.notify("Monika Music Player is already running.")
+                return True
+        except Exception:
+            monika_music_player_process = None
+
+        python_exe = monika_music_player_find_pythonw()
+        if not python_exe:
+            if not silent:
+                renpy.notify("Python 3 windowed executable not found. Set its full path in python_path.txt.")
+            return False
+
+        try:
+            args = [python_exe]
+            if os.path.basename(python_exe).lower() == "pyw.exe":
+                args.append("-3")
+            args.extend([script, "--mas-pid", str(os.getpid())])
+            if startup_delay:
+                args.extend(["--show-delay-ms", str(int(startup_delay))])
+            monika_music_player_log("Starting process with command=%s" % repr(args))
+            monika_music_player_process = subprocess.Popen(args, cwd=os.path.join(root, "player"))
+            monika_music_player_log("Popen success; pid=%s" % monika_music_player_process.pid)
+            if not silent:
+                renpy.notify("Opening Monika Music Player...")
+            return True
+        except Exception as e:
+            monika_music_player_log("ERROR starting player: %s\n%s" % (e, traceback.format_exc()))
+            if not silent:
+                renpy.notify("Could not start Music Player. See game/monika_music_player_debug.log.")
+            return False
+
+    def monika_music_player_autostart_once(silent=False, startup_delay=0):
+        global monika_music_player_autostart_checked, monika_music_player_process
+        if monika_music_player_autostart_checked:
+            # A player process may return immediately if its interpreter crashes
+            # during import. Clear the flag so the delayed retry can recover.
+            try:
+                if monika_music_player_process is not None and monika_music_player_process.poll() is None:
+                    return
+            except Exception:
+                pass
+            monika_music_player_autostart_checked = False
+        enabled = getattr(persistent, "monika_music_player_autostart", True)
+        monika_music_player_log("Autostart trigger fired; enabled=%s; silent=%s" % (enabled, silent))
+        if not enabled:
+            monika_music_player_autostart_checked = True
+            return
+        # Only mark complete after an existing player or a successful Popen.
+        # The delayed overlay retries if the startup callback ran too early.
+        if monika_music_player_launch(silent=silent, startup_delay=startup_delay):
+            monika_music_player_autostart_checked = True
+
+    def monika_music_player_start_callback():
+        # Start the companion in the background, then reveal it after the MAS
+        # splash/menu has had time to appear. This avoids opening behind startup UI.
+        return monika_music_player_autostart_once(silent=True, startup_delay=3500)
+
+    def monika_music_player_toggle_autostart():
+        persistent.monika_music_player_autostart = not getattr(persistent, "monika_music_player_autostart", True)
+        try:
+            renpy.save_persistent()
+        except Exception as e:
+            monika_music_player_log("Could not save autostart preference: %s" % e)
+        if persistent.monika_music_player_autostart:
+            renpy.notify("Music Player will open automatically when MAS starts.")
+        else:
+            renpy.notify("Music Player auto-open is disabled.")
+
+    def monika_music_player_status_path():
+        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+        return os.path.join(appdata, "MonikaMusicPlayer", "now_playing.json")
+
+    def monika_music_player_read_status():
+        try:
+            handle = codecs.open(monika_music_player_status_path(), "r", "utf-8")
+            try:
+                import json
+                payload = json.load(handle)
+            finally:
+                handle.close()
+            if isinstance(payload, dict):
+                try:
+                    if time.time() - float(payload.get("updated_at", 0) or 0) > 20:
+                        monika_music_player_log("Now-playing file is stale; waiting for player metadata")
+                        return None
+                except Exception:
+                    return None
+                return payload
+        except Exception as e:
+            monika_music_player_log("No readable now-playing status yet: %s" % e)
+        return None
+
+    def monika_music_player_install_dependencies():
+        installer = os.path.join(monika_music_player_root(), "scripts", "install_dependencies.bat")
+        if os.path.isfile(installer):
+            try:
+                os.startfile(installer)
+                monika_music_player_log("Dependency installer opened")
+                return
+            except Exception as e:
+                monika_music_player_log("Could not open installer: %s" % e)
+        renpy.notify("Setup script not found. Reinstall the complete Music Player folder.")
+
+    monika_music_player_log("Bootstrap loaded through MAS header.json + main.rpym")
+
+    # Export functions for screens and labels to call explicitly from store.
+    store.monika_music_player_launch = monika_music_player_launch
+    store.monika_music_player_autostart_once = monika_music_player_autostart_once
+    store.monika_music_player_toggle_autostart = monika_music_player_toggle_autostart
+    store.monika_music_player_install_dependencies = monika_music_player_install_dependencies
+    store.monika_music_player_read_status = monika_music_player_read_status
+    monika_music_player_log("Bootstrap functions registered in store")
+
+init 5 python:
+    try:
+        if "monika_music_player_open" not in store.persistent.event_database:
+            store.addEvent(
+                store.Event(
+                    store.persistent.event_database,
+                    eventlabel="monika_music_player_open",
+                    category=["music"],
+                    prompt="Music Player",
+                    pool=True,
+                    unlocked=True
+                )
+            )
+        if "monika_music_player_listening_status" not in store.persistent.event_database:
+            store.addEvent(
+                store.Event(
+                    store.persistent.event_database,
+                    eventlabel="monika_music_player_listening_status",
+                    category=["music"],
+                    prompt="What am I listening to?",
+                    pool=True,
+                    unlocked=True
+                )
+            )
+        monika_music_player_log("Talk topics available/registered")
+    except Exception as e:
+        monika_music_player_log("ERROR registering Talk topic: %s\n%s" % (e, traceback.format_exc()))
+
+label monika_music_player_open:
+    m 1eua "I made a little music player for us."
+    m 3eua "You can play songs from your computer or open an online audio link."
+    $ store.monika_music_player_launch(False)
+    return
+
+label monika_music_player_listening_status:
+    $ _mmp_status = store.monika_music_player_read_status()
+    if _mmp_status and _mmp_status.get("title"):
+        $ _mmp_title = _mmp_status.get("title", "Unknown song")
+        $ _mmp_artist = _mmp_status.get("artist", "Unknown artist")
+        $ _mmp_provider = _mmp_status.get("provider", "your music player")
+        if _mmp_status.get("is_playing", False):
+            m 1eua "You're listening to [_mmp_title] by [_mmp_artist], through [_mmp_provider], right?"
+            m 3hub "I can see the song information while your music player is running. It's a nice way for me to feel a little closer to your day."
+        else:
+            m 1eua "The last song I detected was [_mmp_title] by [_mmp_artist], from [_mmp_provider]."
+            m 1eka "I don't think it's playing right now, though."
+    else:
+        m 1eua "I can't see a song playing yet."
+        m 3eua "Try starting a track in Monika Music, Spotify, or YouTube Music in your browser, and ask me again."
+    return
+
+screen monika_music_player_settings_screen():
+    vbox:
+        xfill True
+        spacing 10
+        text "Monika Music Player" size 22
+        text "F7 opens the player. Talk has Music Player and What am I listening to?" size 14
+        textbutton ("Auto-open when MAS starts: ON" if getattr(store.persistent, "monika_music_player_autostart", True) else "Auto-open when MAS starts: OFF") action Function(store.monika_music_player_toggle_autostart)
+        textbutton "Open Music Player now" action Function(store.monika_music_player_launch, False)
+        textbutton "Ask Monika to check the current song" action Jump("monika_music_player_listening_status")
+        textbutton "Install/check Python + media-sync support" action Function(store.monika_music_player_install_dependencies)
+
+screen monika_music_player_key_overlay():
+    timer 4.0 action Function(store.monika_music_player_autostart_once, False)
+    key "K_F7" action Function(store.monika_music_player_launch, False)
+
+init 5 python:
+    try:
+        if "monika_music_player_key_overlay" not in config.overlay_screens:
+            config.overlay_screens.append("monika_music_player_key_overlay")
+        monika_music_player_log("F7/autostart overlay registered")
+    except Exception as e:
+        monika_music_player_log("ERROR registering overlay: %s\n%s" % (e, traceback.format_exc()))
+    try:
+        # Start callback launches the companion as MAS enters its persistent session.
+        # The overlay timer remains as a delayed fallback if startup launch fails.
+        if monika_music_player_start_callback not in config.start_callbacks:
+            config.start_callbacks.append(monika_music_player_start_callback)
+        monika_music_player_log("Autostart start-callback registered; visible retry scheduled by overlay timer")
+    except Exception as e:
+        monika_music_player_log("Could not register start callback; overlay timer remains: %s\n%s" % (e, traceback.format_exc()))

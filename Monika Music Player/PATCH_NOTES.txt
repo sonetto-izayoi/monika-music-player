@@ -1,0 +1,5 @@
+0.3.0 MAS 0.12.x compatibility fix
+- Replaced header.json + dynamically loaded main.rpym-only registration with a classic main.rpy bootstrap.
+- Explicitly registers through store.mas_submod_utils.Submod(author, name, description, version, settings_pane).
+- Adds boot log before registration so load failures are easier to distinguish.
+- Keeps the music player UI and asset files unchanged.
